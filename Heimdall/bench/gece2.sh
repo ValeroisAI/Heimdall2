@@ -6,7 +6,14 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-python_bin=${PYTHON:-python3}
+python_bin=${PYTHON:-}
+if [[ -z "$python_bin" ]]; then
+    if [[ -n "${VIRTUAL_ENV:-}" ]]; then python_bin="$VIRTUAL_ENV/bin/python"      # etkin ortam kazanır
+    elif [[ -x .venv101/bin/python ]]; then python_bin=.venv101/bin/python
+    elif [[ -x .venv/bin/python ]]; then python_bin=.venv/bin/python
+    else python_bin=python3
+    fi
+fi
 out=${OUT:-runs/gece2}
 hours=${HOURS:-11}
 save_minutes=${SAVE_MINUTES:-5}
