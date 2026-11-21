@@ -276,12 +276,16 @@ fi
 run_py() {
   local title="$1" fix="$2" secs="$3" out rc err
   out=$(mktemp)
+  # Kod bir DOSYADAN çalışmalı: @triton.jit stdin'den okunan betikte kaynağı bulamaz ("should be defined in a Python file").
+  src=$(mktemp --suffix=.py)
+  cat >"$src"
   if command -v timeout >/dev/null 2>&1; then
-    timeout "$secs" "$PYBIN" - >"$out" 2>&1
+    timeout "$secs" "$PYBIN" "$src" >"$out" 2>&1
   else
-    "$PYBIN" - >"$out" 2>&1
+    "$PYBIN" "$src" >"$out" 2>&1
   fi
   rc=$?
+  rm -f "$src"
   if [[ $rc -eq 0 ]] && grep -q '^ok' "$out"; then
     pass "$title — $(grep '^ok' "$out" | head -1)"
   else
