@@ -289,7 +289,7 @@ def cmd_egit(a) -> None:
     dtype = torch.bfloat16 if gpu else torch.float32
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    logf = open(out / "motor.log", "a")
+    logf = open(out / "motor.log", "a", encoding="utf-8")
 
     def log(s):
         print(s, flush=True)
@@ -383,6 +383,8 @@ def cmd_egit(a) -> None:
         log(f"katman {i:2d}/{c.n_layers} ({'dönüşüm' if convert else 'dikkat' if kind == ATTN else 'DeltaNet'}) "
             f"{time.time() - t0:5.0f} sn | {eta(left) if done_attn else 'tahmin ilk dönüşümden sonra'}{peak}")
     log(f"bitti: {out / 'donusum_param.pt'} ({len(conv)} katman, toplam {(time.time() - t_all) / 3600:.2f} sa)")
+    logf.close()
+    del H  # HiddenStore owns the memmap. Windows requires its release before unlinking.
     h_file.unlink(missing_ok=True)
     st_file.unlink(missing_ok=True)
 

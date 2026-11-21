@@ -1,0 +1,315 @@
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -7,10 +7,18 @@
+ #include <algorithm>
+ #include <array>
+ #include <cmath>
++#include <chrono>
++#include <cstdio>
+ #include <cstdlib>
+ #include <fstream>
+ #include <iterator>
++#include <numeric>
++#include <string_view>
+ #include <vector>
++
++#if defined(__SSE2__) || defined(_M_X64)
++#include <emmintrin.h>
++#endif
+ 
+ namespace {
+ constexpr int replay_depth = 32768;
+@@ -47,6 +55,209 @@
+ const gjallar_replay & replay_config() {
+     static const gjallar_replay config;
+     return config;
++}
++constexpr int live_width = 256;
++constexpr int live_heads = 4;
++constexpr int live_block = 64;
++constexpr int live_window = 512;
++constexpr int live_sinks = 4;
++constexpr int live_window_rows = live_sinks + live_window + live_block;
++constexpr int live_blocks = (replay_depth - live_window + 1 - live_sinks) / live_block;
++constexpr int live_history = 64;
++constexpr int live_shortlist = 64;
++constexpr int live_budget = replay_layers * replay_steps / 4;
++
++struct gjallar_live;
++struct gjallar_live_layer {
++    gjallar_live * owner = nullptr;
++    int anchor = 0;
++    std::array<double, live_history> history{};
++    std::vector<float> centroids;
++    std::vector<ggml_fp16_t> keys;
++};
++
++struct gjallar_live {
++    enum class read_policy { adaptive, always, never };
++    std::array<gjallar_live_layer, replay_layers> layers;
++    read_policy policy = read_policy::adaptive;
++    bool enabled = false;
++    int calls = 0;
++    int opens = 0;
++    int opened_this_step = 0;
++    double score_seconds = 0;
++    double rerank_seconds = 0;
++    double quantile = 0.75;
++
++    gjallar_live() {
++        const char * path = std::getenv("GJALLAR_LIVE_ARCHIVE");
++        if (!path) {
++            return;
++        }
++        GGML_ASSERT(replay_config().route.empty());
++        const auto & cfg = llama_bifrost_ret_cfg();
++        GGML_ASSERT(cfg.k == replay_topk && cfg.block == live_block &&
++                    cfg.window == live_window && cfg.sinks == live_sinks);
++        if (const char * value = std::getenv("GJALLAR_LIVE_POLICY")) {
++            const std::string_view name(value);
++            if (name == "always") {
++                policy = read_policy::always;
++            } else if (name == "never") {
++                policy = read_policy::never;
++            } else {
++                GGML_ASSERT(name == "adaptive");
++            }
++        }
++        std::ifstream input(path, std::ios::binary);
++        std::array<char, 8> magic{};
++        GGML_ASSERT(input.read(magic.data(), magic.size()) &&
++                    std::string_view(magic.data(), magic.size()) == "GJLIVE01");
++        auto read = [&](auto * data, size_t count) {
++            GGML_ASSERT(input.read(reinterpret_cast<char *>(data), count * sizeof(*data)));
++        };
++        for (int anchor = 0; anchor < replay_layers; ++anchor) {
++            auto & layer = layers[anchor];
++            layer.owner = this;
++            layer.anchor = anchor;
++            layer.centroids.resize(replay_groups * live_blocks * live_width);
++            layer.keys.resize(replay_groups * live_blocks * live_block * live_width);
++            read(layer.history.data(), layer.history.size());
++            read(layer.centroids.data(), layer.centroids.size());
++            read(layer.keys.data(), layer.keys.size());
++            GGML_ASSERT(std::all_of(layer.history.begin(), layer.history.end(),
++                                    [](double value) { return std::isfinite(value); }));
++        }
++        GGML_ASSERT(input.peek() == std::ifstream::traits_type::eof());
++        enabled = true;
++    }
++};
++
++gjallar_live & live_config() {
++    static gjallar_live run;
++    return run;
++}
++
++using live_query_pack = std::array<std::array<float, live_heads>, live_width>;
++
++std::array<float, live_heads> live_head_dots(const live_query_pack & q, const float * key) {
++    std::array<float, live_heads> sums{};
++#if defined(__SSE2__) || defined(_M_X64)
++    static_assert(live_heads == 4);
++    // One SIMD lane per query head preserves the scalar accumulation order.
++    __m128 acc = _mm_setzero_ps();
++    for (int d = 0; d < live_width; ++d) {
++        acc = _mm_add_ps(acc, _mm_mul_ps(_mm_loadu_ps(q[d].data()), _mm_set1_ps(key[d])));
++    }
++    _mm_storeu_ps(sums.data(), acc);
++#else
++    for (int d = 0; d < live_width; ++d) {
++        for (int h = 0; h < live_heads; ++h) {
++            sums[h] += q[d][h] * key[d];
++        }
++    }
++#endif
++    return sums;
++}
++
++double live_lse(const float * scores, int size, double scale) {
++    const double peak = *std::max_element(scores, scores + size) * scale;
++    double sum = 0;
++    for (int i = 0; i < size; ++i) {
++        sum += std::exp(scores[i] * scale - peak);
++    }
++    return peak + std::log(sum);
++}
++
++void live_decide(ggml_tensor * dst, int ith, int nth, void * user) {
++    GGML_ASSERT(ith == 0 && nth == 1);
++    auto & layer = *static_cast<gjallar_live_layer *>(user);
++    auto & run = *layer.owner;
++    GGML_ASSERT(run.calls < replay_layers * replay_steps && run.calls % replay_layers == layer.anchor);
++    const int step = run.calls / replay_layers;
++    const auto * q = static_cast<const float *>(dst->src[0]->data);
++    const auto * window = static_cast<const float *>(dst->src[1]->data);
++    auto * result = static_cast<int32_t *>(dst->data);
++    std::fill_n(result, replay_per_step + 1, 0);
++
++    using clock = std::chrono::steady_clock;
++    const auto start = clock::now();
++    std::array<std::array<float, live_blocks>, replay_groups> rankings{};
++    double score = 0;
++    std::array<live_query_pack, replay_groups> packed{};
++    for (int g = 0; g < replay_groups; ++g) {
++        for (int d = 0; d < live_width; ++d) {
++            for (int h = 0; h < live_heads; ++h) {
++                packed[g][d][h] = q[(g * live_heads + h) * live_width + d];
++            }
++        }
++        std::array<std::array<float, live_blocks>, live_heads> dots{};
++        for (int b = 0; b < live_blocks; ++b) {
++            const float * centroid = layer.centroids.data() + (g * live_blocks + b) * live_width;
++            auto heads = live_head_dots(packed[g], centroid);
++            rankings[g][b] = *std::max_element(heads.begin(), heads.end());
++            for (int h = 0; h < live_heads; ++h) {
++                dots[h][b] = heads[h];
++            }
++        }
++        for (int h = 0; h < live_heads; ++h) {
++            const int i = g * live_heads + h;
++            score += live_lse(dots[h].data(), live_blocks, 1.0 / 16) + std::log(double(live_block)) -
++                     live_lse(window + i * live_window_rows, live_window_rows, 1.0);
++        }
++    }
++    score /= replay_groups * live_heads;
++    GGML_ASSERT(std::isfinite(score));
++    auto sorted = layer.history;
++    std::sort(sorted.begin(), sorted.end());
++    const double slot = run.quantile * (live_history - 1);
++    const int lo = int(slot);
++    const double threshold = sorted[lo] + (slot - lo) * (sorted[lo + 1] - sorted[lo]);
++    layer.history[step % live_history] = score;
++    const bool open = run.policy == gjallar_live::read_policy::always ||
++                      (run.policy == gjallar_live::read_policy::adaptive && run.opens < live_budget && score > threshold);
++    const auto ranked = clock::now();
++    run.score_seconds += std::chrono::duration<double>(ranked - start).count();
++    if (open) {
++        ++run.opens;
++        ++run.opened_this_step;
++        result[replay_per_step] = 1;
++        for (int g = 0; g < replay_groups; ++g) {
++            std::array<int, live_blocks> shortlist{};
++            std::iota(shortlist.begin(), shortlist.end(), 0);
++            auto & ranking = rankings[g];
++            auto score_order = [&](int a, int b) {
++                return ranking[a] == ranking[b] ? a < b : ranking[a] > ranking[b];
++            };
++            std::partial_sort(shortlist.begin(), shortlist.begin() + live_shortlist, shortlist.end(), score_order);
++            for (int j = 0; j < live_shortlist; ++j) {
++                const int b = shortlist[j];
++                float best = -INFINITY;
++                for (int t = 0; t < live_block; ++t) {
++                    const auto offset = ((b * live_block + t) * replay_groups + g) * live_width;
++                    std::array<float, live_width> key{};
++                    ggml_fp16_to_fp32_row(layer.keys.data() + offset, key.data(), live_width);
++                    auto heads = live_head_dots(packed[g], key.data());
++                    best = std::max(best, *std::max_element(heads.begin(), heads.end()));
++                }
++                ranking[b] = best;
++            }
++            std::partial_sort(shortlist.begin(), shortlist.begin() + replay_topk,
++                              shortlist.begin() + live_shortlist, score_order);
++            std::copy_n(shortlist.begin(), replay_topk, result + g * replay_topk);
++        }
++    }
++    if (open) {
++        run.rerank_seconds += std::chrono::duration<double>(clock::now() - ranked).count();
++    }
++    std::fprintf(stderr, "gjallar_live,%d,%d,%d,%.9g,%.9g\n", step, layer.anchor, int(open), score, threshold);
++    if (++run.calls % replay_layers == 0) {
++        run.quantile = std::clamp(run.quantile + (double(run.opened_this_step) / replay_layers - 0.25) /
++                                             (4 * live_history), 0.50, 0.98);
++        run.opened_this_step = 0;
++    }
++    if (run.calls == replay_layers * replay_steps) {
++        std::fprintf(stderr, "gjallar_live_profile,score_seconds=%.6f,rerank_seconds=%.6f,reads=%d\n",
++                     run.score_seconds, run.rerank_seconds, run.opens);
++    }
+ }
+ } // namespace
+ 
+@@ -1220,7 +1431,7 @@
+         sw[S + c - ws] = (int32_t) c;
+     }
+     for (int64_t m = 0; m < M; ++m) {
+-        const bool exact_window = replay_config().route.empty() || ws + m - S >= p - W + 1;
++        const bool exact_window = (!live_config().enabled && replay_config().route.empty()) || ws + m - S >= p - W + 1;
+         const bool ok = m < S || m >= SW || (m - S <= p - ws && exact_window);
+         km[m] = ok ? 0.0f : -INFINITY;
+     }
+@@ -1258,7 +1469,16 @@
+ }
+ 
+ bool llm_graph_input_bifrost_ret::can_reuse(const llm_graph_params & params) {
+-    if (!replay_config().route.empty()) { return false; }
++    if (!replay_config().route.empty()) {
++        return false;
++    }
++    if (live_config().enabled &&
++        (params.ubatch.n_tokens != 1 || params.ubatch.pos[0] <= replay_depth ||
++         params.ubatch.pos[0] >= replay_depth + replay_steps)) {
++        // The live graph starts and ends at fixed positions. Inside the range,
++        // the window indices and masks are supplied anew for every step.
++        return false;
++    }
+     const auto * kvc = static_cast<const llama_memory_hybrid_context *>(params.mctx)->get_attn();
+     const int64_t L = cfg.block, S = cfg.sinks, T = params.ubatch.n_tokens;
+     const int64_t nbu = std::clamp<int64_t>(((int64_t) kvc->get_n_kv() - S) / L, 1, n_blk_k);
+@@ -1305,7 +1525,8 @@
+         cb(v_st, "ret_v_archive", il);
+     }
+     ggml_tensor * ksum = nullptr;
+-    if (replay.route.empty()) {
++    auto & live = live_config();
++    if (replay.route.empty() && !live.enabled) {
+         // re-pool the blocks this ubatch wrote into: per-head max and min of the keys over the block's cells
+         ggml_tensor * x = ggml_get_rows(ctx0, blocks(k_st), ri->upd_src);                       // [GD*L, n_upd]
+         x = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, x, GD, L, ri->n_upd), 1, 0, 2, 3));   // [L, GD, n_upd]
+@@ -1323,9 +1544,11 @@
+     const bool scheduled = !replay.route.empty() && ri->dec && position >= 0 && position < replay_steps &&
+         il >= 3 && il <= 23 && il % 4 == 3;
+     const int replay_layer = (il - 3) / 4;
++    const bool live_step = live.enabled && ri->dec && position >= 0 && position < replay_steps &&
++        il >= 3 && il <= 23 && il % 4 == 3;
+     const uint8_t mode = scheduled ? replay.route[replay_layer * replay_steps + position] : 1;
+     ggml_tensor * cur;
+-    if (!ri->dec || (!replay.route.empty() && mode == 1)) {
++    if (!ri->dec || (!replay.route.empty() && mode == 1) || (live.enabled && !live_step)) {
+         cur = build_attn_mha(q_cur, mctx->get_k(ctx0, il), mctx->get_v(ctx0, il), nullptr,
+                              inp->get_kq_mask(), nullptr, nullptr, 0, kq_scale, il);
+     } else if (scheduled && mode == 0) {
+@@ -1344,7 +1567,23 @@
+ 
+         ggml_tensor * q = ggml_reshape_3d(ctx0, q_cur, D, R, G);
+         ggml_tensor * top;
+-        if (scheduled) {
++        ggml_tensor * mask = ri->kq_mask;
++        if (live_step) {
++            GGML_ASSERT(K == replay_topk && D == live_width && G == replay_groups && R == live_heads &&
++                        SW == live_window_rows && kq_scale == 1.0f / 16);
++            auto * w = ggml_get_rows(ctx0, ggml_view_2d(ctx0, k_st, GD, kv_size,
++                                    ggml_row_size(k_st->type, GD), 0), ri->idx_sw);
++            w = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, w, D, G, SW), 0, 2, 1, 3));
++            auto * window_mask = ggml_cont(ctx0, ggml_view_2d(ctx0, mask, SW, R, mask->nb[1], 0));
++            auto * logits = ggml_add(ctx0, ggml_scale(ctx0, ggml_mul_mat(ctx0, w, q), kq_scale), window_mask);
++            ggml_tensor * sources[] = {ggml_cont(ctx0, q), ggml_cont(ctx0, logits)};
++            auto * choice = ggml_custom_4d(ctx0, GGML_TYPE_I32, replay_per_step + 1, 1, 1, 1,
++                                           sources, 2, live_decide, 1, &live.layers[replay_layer]);
++            top = ggml_view_1d(ctx0, choice, K * G, 0);
++            auto * open = ggml_view_1d(ctx0, choice, 1, replay_per_step * sizeof(int32_t));
++            auto * archive_mask = ggml_log(ctx0, ggml_cast(ctx0, open, GGML_TYPE_F32));
++            mask = ggml_concat(ctx0, window_mask, ggml_repeat_4d(ctx0, archive_mask, K * L, R, 1, 1), 0);
++        } else if (scheduled) {
+             GGML_ASSERT(mode == 2 && K == replay_topk && G == replay_groups);
+             top = ggml_view_1d(ctx0, ri->cand, K * G, replay_layer * replay_per_step * sizeof(int32_t));
+         } else {
+@@ -1372,7 +1611,7 @@
+         };
+         ggml_tensor * k  = gather(k_st);
+         ggml_tensor * vt = ggml_cont(ctx0, ggml_permute(ctx0, gather(v_st), 1, 0, 2, 3));    // [M, D, G]
+-        ggml_tensor * kq = ggml_soft_max_ext(ctx0, ggml_mul_mat(ctx0, k, q), ri->kq_mask, kq_scale, 0.0f);  // [M, R, G]
++        ggml_tensor * kq = ggml_soft_max_ext(ctx0, ggml_mul_mat(ctx0, k, q), mask, kq_scale, 0.0f);  // [M, R, G]
+         cur = ggml_reshape_2d(ctx0, ggml_mul_mat(ctx0, vt, kq), D * R * G, 1);              // [D*H, 1]
+     }
+     cb(cur, "kqv_out", il);

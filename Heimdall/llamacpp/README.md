@@ -110,10 +110,13 @@ No training; it works on the original model too.
 * Reference: `heimdall/hibrit.py` (`HybridAttention.set_retrieval`); `bench/erisim_parola.py` compares pass-key
   recall with full attention, window-only and retrieval.
 
+## Windows Vulkan measurements
+
+The pinned patch builds with MSVC and the Vulkan SDK. On an RX 9070 XT with the Windows AMD driver, the same-runtime run with Qwen3.5-0.8B Q4_K_M measured 226 → 335 tok/s at 64K when replacing the global attention layers with Bifrost. Its conversion tensors use their untrained initial values. The [Windows benchmark notes](../bench/vulkan_baseline.md) include the build commands, buffer sizes, cache precision comparisons, and profiling for fixed retrieval.
+
 ## Not done / not verified
 
-* **Vulkan is verified only on lavapipe (software).** Speed on a real GPU is not measured yet. The CUDA/HIP 256 kernel case is
-  not compiled here (no toolkit). Run `ADIM=llamaprova` first on a new machine.
+* The CUDA/HIP head-dimension-256 path needs a build and validation on a machine with the matching toolkit.
 * **MTP draft decoding** with Bifrost layers needs recurrent rollback (`n_rs_seq > 0`), which is not implemented and asserts.
 * Bifrost layers still get the unused per-layer DeltaNet r/s rows (~3 MB/layer at 27B).
 * The MTP layer is left unconverted (full KV, ~4 KB/token) and is only used by the draft path.
