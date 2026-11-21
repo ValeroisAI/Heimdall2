@@ -60,6 +60,16 @@ def _converted(tiny_dir, window=8, sinks=2):
 
 
 def test_teacher_matches_transformers(tmp_path):
+    import importlib.util, os, subprocess, sys
+    if importlib.util.find_spec("fla") is not None and os.environ.get("HEIMDALL_NO_FLA") != "1":
+        # fla kuruluysa transformers referansı onun GPU çekirdeğine yönlendirir (CPU tensörde çöker, hata payı da 1e-4'ten
+        # büyük). Karşılaştırma saf PyTorch referansla yapılmalı: fla gizlenmiş temiz bir süreçte koş.
+        code = ("import sys; sys.modules['fla'] = None; import pytest; "
+                f"sys.exit(pytest.main([{__file__!r} + '::test_teacher_matches_transformers', '-q', '-x', '-p', 'no:cacheprovider']))")
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                           env={**os.environ, "HEIMDALL_NO_FLA": "1", "CUDA_VISIBLE_DEVICES": ""})
+        assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-1000:]
+        return
     tr = pytest.importorskip("transformers")
     if not hasattr(tr, "Qwen3_5ForCausalLM"):
         pytest.skip("transformers sürümünde qwen3_5 yok")

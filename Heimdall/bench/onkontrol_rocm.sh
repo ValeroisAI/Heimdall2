@@ -12,8 +12,9 @@ NEED_RAM_GB=${NEED_RAM_GB:-16}
 SKIP_GPU=${SKIP_GPU:-0}
 PYBIN=${PYTHON:-}
 if [[ -z "$PYBIN" ]]; then
-  if [[ -x .venv/bin/python ]]; then PYBIN=.venv/bin/python
+  if [[ -n "${VIRTUAL_ENV:-}" && -x "$VIRTUAL_ENV/bin/python" ]]; then PYBIN="$VIRTUAL_ENV/bin/python"   # etkin ortam kazanır
   elif [[ -x .venv101/bin/python ]]; then PYBIN=.venv101/bin/python
+  elif [[ -x .venv/bin/python ]]; then PYBIN=.venv/bin/python
   elif command -v python3 >/dev/null 2>&1; then PYBIN=python3
   else PYBIN=python
   fi
@@ -39,7 +40,7 @@ echo "limits için oturumu kapatıp tekrar gir"'
 LAUNCH='systemd-inhibit --what=idle:sleep --why="heimdall gece2" --mode=block bash bench/gece2.sh --hours 11 veri/fineweb.bin:0.7 veri/cosmo.bin:0.3'
 
 export PYTORCH_HIP_ALLOC_CONF="${PYTORCH_HIP_ALLOC_CONF:-expandable_segments:True}"
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"   # PYTORCH_CUDA_ALLOC_CONF artık uyarı veriyor
 export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL="${TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL:-1}"
 export PYTHONUNBUFFERED=1
 
@@ -389,7 +390,7 @@ fi
 echo
 echo "--- başlatma (tmux içinde; inhibit gece2'nin içinde YOK, bu yüzden sarmal şart) ---"
 echo "  tmux new -s gece"
-echo "  source .venv/bin/activate"
+echo "  source ${VIRTUAL_ENV:-.venv}/bin/activate"
 echo "  $LAUNCH 2>&1 | tee -a gece2.log"
 echo "  # başka pencere: python bench/izle.py gece2.log --out runs/gece2"
 echo "  # SSH kopunca: tmux attach -t gece"
