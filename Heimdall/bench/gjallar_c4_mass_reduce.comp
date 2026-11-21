@@ -1,0 +1,44 @@
+#version 450
+
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0) readonly buffer HeadScores { vec4 values[]; } scores;
+layout(set = 0, binding = 2) writeonly buffer Mass { vec4 values[]; } mass;
+layout(push_constant) uniform Counts { uint rows_per_group; } counts;
+
+shared vec4 partial[128];
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint group = gl_WorkGroupID.x;
+    uint start = group * counts.rows_per_group;
+    vec4 peak = vec4(uintBitsToFloat(0xff800000u));
+    for (uint row = lane; row < counts.rows_per_group; row += 128) {
+        peak = max(peak, scores.values[start + row] * (1.0 / 16.0));
+    }
+    partial[lane] = peak;
+    barrier();
+    for (uint stride = 64; stride > 0; stride /= 2) {
+        if (lane < stride) {
+            partial[lane] = max(partial[lane], partial[lane + stride]);
+        }
+        barrier();
+    }
+    peak = partial[0];
+    barrier();
+
+    vec4 sum = vec4(0);
+    for (uint row = lane; row < counts.rows_per_group; row += 128) {
+        sum += exp(scores.values[start + row] * (1.0 / 16.0) - peak);
+    }
+    partial[lane] = sum;
+    barrier();
+    for (uint stride = 64; stride > 0; stride /= 2) {
+        if (lane < stride) {
+            partial[lane] += partial[lane + stride];
+        }
+        barrier();
+    }
+    if (lane == 0) {
+        mass.values[group] = peak + log(partial[0]) + log(64.0);
+    }
+}

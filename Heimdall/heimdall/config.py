@@ -112,6 +112,8 @@ class TrainPreset:
     lr_muon: float = 0.02
     lr_adam: float = 3e-3
     grad_ckpt: bool = False
+    arch: str = "hibrit"
+    bits: int | None = None
 
 
 PRESETS = {
@@ -124,6 +126,10 @@ PRESETS = {
     # ~100M
     "temel": TrainPreset(HeimdallConfig(d_model=768, n_layers=12, n_heads=6, archival_heads=2,
                                         attn_heads=12, attn_kv_heads=4), 2048, 8, 262_144, lr_adam=2e-3),
+    # 97.7M: the measured binary FFN recipe, also used by bench/gece2.sh.
+    "gece": TrainPreset(HeimdallConfig(d_model=768, n_layers=12, n_heads=6, archival_heads=2,
+                                       attn_heads=12, attn_kv_heads=4), 2048, 8, 262_144,
+                        lr_adam=2e-3, arch="bit", bits=1),
     # ~330M: gradient checkpointing ile 16 GB
     # ~540M toplam / ~150M aktif MoE: token başına "temel" kadar hesap, 5 kat kapasite
     "moe": TrainPreset(HeimdallConfig(d_model=768, n_layers=16, n_heads=6, archival_heads=2, attn_heads=12,

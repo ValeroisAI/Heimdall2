@@ -1,0 +1,40 @@
+#version 450
+
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0) readonly buffer PackedBounds { uint words[]; } bounds;
+layout(set = 0, binding = 1) readonly buffer Queries { vec4 values[]; } queries;
+layout(set = 0, binding = 2) writeonly buffer Scores { float values[]; } scores;
+layout(push_constant) uniform Counts { uint rows_per_group; } counts;
+
+// A row holds 128 packed words of S8 data followed by 16 f32 group scales.
+// Each query vec4 holds the coefficients of the four heads sharing one KV group.
+shared vec4 partial[32];
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x;
+    uint row_start = row * 144;
+    uint query_start = (row / counts.rows_per_group) * 512;
+    vec4 sum = vec4(0);
+    for (uint word = lane; word < 128; word += 32) {
+        uint packed = bounds.words[row_start + word];
+        float scale = uintBitsToFloat(bounds.words[row_start + 128 + word / 8]);
+        for (int j = 0; j < 4; ++j) {
+            float value = scale * float(bitfieldExtract(int(packed), 8 * j, 8));
+            sum += value * queries.values[query_start + 4 * word + uint(j)];
+        }
+    }
+
+    partial[lane] = sum;
+    barrier();
+    for (uint stride = 16; stride > 0; stride /= 2) {
+        if (lane < stride) {
+            partial[lane] += partial[lane + stride];
+        }
+        barrier();
+    }
+    if (lane == 0) {
+        vec4 result = partial[0];
+        scores.values[row] = max(max(result.x, result.y), max(result.z, result.w));
+    }
+}

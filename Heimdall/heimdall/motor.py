@@ -369,7 +369,7 @@ def cmd_egit(a) -> None:
     dtype = torch.bfloat16 if gpu else torch.float32
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    logf = open(out / "motor.log", "a")
+    logf = open(out / "motor.log", "a", encoding="utf-8")
 
     def log(s):
         print(s, flush=True)
@@ -505,6 +505,9 @@ def cmd_egit(a) -> None:
             log(f"durduruldu: --en-fazla-katman {a.en_fazla_katman} (hız ölçümü). Tam koşu için başka bir --out kullanın.")
             return
     log(f"bitti: {out / 'donusum_param.pt'} ({len(conv)} katman, toplam {(time.time() - t_all) / 3600:.2f} sa)")
+    logf.close()
+    Hin = Hout = None
+    Hs.clear()  # HiddenStore'lar memmap'i tutar; Windows silmeden önce bırakılmasını ister.
     for f in h_files:
         f.unlink(missing_ok=True)
     st_file.unlink(missing_ok=True)

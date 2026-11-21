@@ -398,7 +398,9 @@ def run(args) -> int:
     if writers:
         writers.close()
         manifest["cikti"] = {k: dict(ornek=writers.count[k], token=writers.tokens[k]) for k in writers.count}
-        (Path(args.out) / "manifest.json").write_text(json.dumps(manifest, indent=1, ensure_ascii=False, default=str))
+        (Path(args.out) / "manifest.json").write_text(
+            json.dumps(manifest, indent=1, ensure_ascii=False, default=str), encoding="utf-8"
+        )
         print(f"\nYazıldı: {args.out}  ({time.time() - t0:.0f} sn)", file=sys.stderr)
         for k, v in sorted(manifest["cikti"].items()):
             print(f"   {k:14s} {v['ornek']:>8,} örnek  ~{v['token'] / 1e6:,.1f}M token", file=sys.stderr)

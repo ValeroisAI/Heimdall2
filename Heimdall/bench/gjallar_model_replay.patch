@@ -1,0 +1,244 @@
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -5,10 +5,50 @@
+ #include "llama-kv-cache.h"
+ 
+ #include <algorithm>
+-#include <cstdlib>
+ #include <array>
+ #include <cmath>
++#include <cstdlib>
++#include <fstream>
++#include <iterator>
+ #include <vector>
++
++namespace {
++constexpr int replay_depth = 32768;
++constexpr int replay_steps = 256;
++constexpr int replay_layers = 6;
++constexpr int replay_groups = 2;
++constexpr int replay_topk = 16;
++constexpr int replay_per_step = replay_groups * replay_topk;
++
++struct gjallar_replay {
++    std::vector<uint8_t> route;
++    std::vector<int32_t> picks;
++
++    gjallar_replay() {
++        if (const char * file = std::getenv("GJALLAR_DIAGNOSTIC_ROUTE")) {
++            std::ifstream input(file, std::ios::binary);
++            route.assign(std::istreambuf_iterator<char>(input), {});
++            GGML_ASSERT(route.size() == replay_layers * replay_steps);
++            GGML_ASSERT(std::all_of(route.begin(), route.end(), [](uint8_t mode) { return mode <= 2; }));
++            if (std::find(route.begin(), route.end(), 2) != route.end()) {
++                const char * path = std::getenv("GJALLAR_DIAGNOSTIC_PICKS");
++                GGML_ASSERT(path != nullptr);
++                std::ifstream blocks(path, std::ios::binary);
++                picks.resize(replay_layers * replay_steps * replay_per_step);
++                GGML_ASSERT(blocks.read(reinterpret_cast<char *>(picks.data()), picks.size() * sizeof(int32_t)));
++                GGML_ASSERT(blocks.peek() == std::ifstream::traits_type::eof());
++            }
++            const auto & cfg = llama_bifrost_ret_cfg();
++            GGML_ASSERT(cfg.k == replay_topk && cfg.block == 64 && cfg.window == 512 && cfg.sinks == 4);
++        }
++    }
++};
++
++const gjallar_replay & replay_config() {
++    static const gjallar_replay config;
++    return config;
++}
++} // namespace
+ 
+ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
+@@ -248,7 +288,9 @@
+             std::vector<ggml_tensor *> ins = { r->upd_dst, r->upd_src, r->upd_mask };
+             if (dec) {
+                 const int64_t M = S + rc.window + L + rc.k * L;
+-                r->cand    = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_blk_u);
++                r->cand    = !replay_config().route.empty()
++                    ? ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, replay_layers * replay_per_step)
++                    : ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_blk_u);
+                 r->idx_sw  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, S + rc.window + L);
+                 r->kq_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, M, n_head / n_head_kv);
+                 ins.insert(ins.end(), { r->cand, r->idx_sw, r->kq_mask });
+@@ -1144,21 +1186,23 @@
+     for (int64_t t = 0; t < T; ++t) {
+         GGML_ASSERT(ub->pos[t] == p0 + t && "bifrost retrieval: one sequence with consecutive positions");
+     }
+-    // summary rows to rewrite: every block this ubatch wrote into (cells past p1 masked out); spare row otherwise
+-    std::vector<int32_t> dst(n_upd, (int32_t) n_blk_k), src(n_upd, 0);
+-    std::vector<float>   um(L * n_upd, 0.0f);
+-    if (p1 >= S) {
+-        const int64_t b0 = (std::max(p0, S) - S) / L, b1 = std::min((p1 - S) / L, n_blk_k - 1);
+-        for (int64_t b = b0, i = 0; b <= b1 && i < n_upd; ++b, ++i) {
+-            dst[i] = src[i] = (int32_t) b;
+-            for (int64_t j = 0; j < L; ++j) {
+-                um[i * L + j] = S + b * L + j <= p1 ? 0.0f : -INFINITY;
++    if (upd_dst->buffer) {
++        // summary rows to rewrite: every block this ubatch wrote into (cells past p1 masked out); spare row otherwise
++        std::vector<int32_t> dst(n_upd, (int32_t) n_blk_k), src(n_upd, 0);
++        std::vector<float>   um(L * n_upd, 0.0f);
++        if (p1 >= S) {
++            const int64_t b0 = (std::max(p0, S) - S) / L, b1 = std::min((p1 - S) / L, n_blk_k - 1);
++            for (int64_t b = b0, i = 0; b <= b1 && i < n_upd; ++b, ++i) {
++                dst[i] = src[i] = (int32_t) b;
++                for (int64_t j = 0; j < L; ++j) {
++                    um[i * L + j] = S + b * L + j <= p1 ? 0.0f : -INFINITY;
++                }
+             }
+         }
+-    }
+-    ggml_backend_tensor_set(upd_dst,  dst.data(), 0, ggml_nbytes(upd_dst));
+-    ggml_backend_tensor_set(upd_src,  src.data(), 0, ggml_nbytes(upd_src));
+-    ggml_backend_tensor_set(upd_mask, um.data(),  0, ggml_nbytes(upd_mask));
++        ggml_backend_tensor_set(upd_dst,  dst.data(), 0, ggml_nbytes(upd_dst));
++        ggml_backend_tensor_set(upd_src,  src.data(), 0, ggml_nbytes(upd_src));
++        ggml_backend_tensor_set(upd_mask, um.data(),  0, ggml_nbytes(upd_mask));
++    }
+     if (!dec) {
+         return;
+     }
+@@ -1176,18 +1220,45 @@
+         sw[S + c - ws] = (int32_t) c;
+     }
+     for (int64_t m = 0; m < M; ++m) {
+-        const bool ok = m < S || m >= SW || m - S <= p - ws;
++        const bool exact_window = replay_config().route.empty() || ws + m - S >= p - W + 1;
++        const bool ok = m < S || m >= SW || (m - S <= p - ws && exact_window);
+         km[m] = ok ? 0.0f : -INFINITY;
+     }
+     for (int64_t r = 1; r < n_rep; ++r) {
+         std::copy(km.begin(), km.begin() + M, km.begin() + r * M);
+     }
+-    ggml_backend_tensor_set(cand,    cd.data(), 0, ggml_nbytes(cand));
+-    ggml_backend_tensor_set(idx_sw,  sw.data(), 0, ggml_nbytes(idx_sw));
+-    ggml_backend_tensor_set(kq_mask, km.data(), 0, ggml_nbytes(kq_mask));
++    if (cand->buffer) {
++        const auto & replay = replay_config();
++        if (replay.route.empty()) {
++            ggml_backend_tensor_set(cand, cd.data(), 0, ggml_nbytes(cand));
++        } else {
++            const int64_t step = p - replay_depth;
++            GGML_ASSERT(step >= 0 && step < replay_steps);
++            std::array<int32_t, replay_layers * replay_per_step> selected{};
++            for (int layer = 0; layer < replay_layers; ++layer) {
++                const int64_t index = layer * replay_steps + step;
++                if (replay.route[index] == 2) {
++                    auto row = replay.picks.begin() + index * replay_per_step;
++                    for (int g = 0; g < replay_groups; ++g) {
++                        const auto first = row + g * replay_topk;
++                        GGML_ASSERT(std::all_of(first, first + replay_topk, [&](int32_t b) { return b >= 0 && b < nc; }));
++                        std::array<int32_t, replay_topk> ids;
++                        std::copy_n(first, replay_topk, ids.begin());
++                        std::sort(ids.begin(), ids.end());
++                        GGML_ASSERT(std::adjacent_find(ids.begin(), ids.end()) == ids.end());
++                    }
++                    std::copy_n(row, replay_per_step, selected.begin() + layer * replay_per_step);
++                }
++            }
++            ggml_backend_tensor_set(cand, selected.data(), 0, ggml_nbytes(cand));
++        }
++    }
++    if (idx_sw->buffer) {     ggml_backend_tensor_set(idx_sw,  sw.data(), 0, ggml_nbytes(idx_sw)); }
++    if (kq_mask->buffer) {     ggml_backend_tensor_set(kq_mask, km.data(), 0, ggml_nbytes(kq_mask)); }
+ }
+ 
+ bool llm_graph_input_bifrost_ret::can_reuse(const llm_graph_params & params) {
++    if (!replay_config().route.empty()) { return false; }
+     const auto * kvc = static_cast<const llama_memory_hybrid_context *>(params.mctx)->get_attn();
+     const int64_t L = cfg.block, S = cfg.sinks, T = params.ubatch.n_tokens;
+     const int64_t nbu = std::clamp<int64_t>(((int64_t) kvc->get_n_kv() - S) / L, 1, n_blk_k);
+@@ -1228,34 +1299,65 @@
+         return ggml_view_2d(ctx0, st, GD * L, ri->n_blk_k, ggml_row_size(st->type, GD * L), ggml_row_size(st->type, GD * S));
+     };
+ 
+-    // re-pool the blocks this ubatch wrote into: per-head max and min of the keys over the block's cells
+-    ggml_tensor * x = ggml_get_rows(ctx0, blocks(k_st), ri->upd_src);                       // [GD*L, n_upd]
+-    x = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, x, GD, L, ri->n_upd), 1, 0, 2, 3));   // [L, GD, n_upd]
+-    auto pool_max = [&](ggml_tensor * y) {                                                   // -> [D, n_upd, G]
+-        y = ggml_add(ctx0, y, ri->upd_mask);
+-        y = ggml_pool_1d(ctx0, ggml_reshape_2d(ctx0, y, L, GD * ri->n_upd), GGML_OP_POOL_MAX, L, L, 0);
+-        return ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, y, D, G, ri->n_upd), 0, 2, 1, 3));
+-    };
+-    ggml_tensor * upd  = ggml_concat(ctx0, pool_max(x), ggml_neg(ctx0, pool_max(ggml_neg(ctx0, x))), 2);  // [D, n_upd, 2G]
+-    ggml_tensor * ksum = ggml_set_rows(ctx0, mctx->get_ksum(il), upd, ri->upd_dst);        // [D, n_blk_k + 1, 2G]
+-    ggml_build_forward_expand(gf, ksum);
+-    cb(ksum, "ret_ksum", il);
+-
++    const auto & replay = replay_config();
++    if (!replay.route.empty()) {
++        cb(k_st, "ret_k_archive", il);
++        cb(v_st, "ret_v_archive", il);
++    }
++    ggml_tensor * ksum = nullptr;
++    if (replay.route.empty()) {
++        // re-pool the blocks this ubatch wrote into: per-head max and min of the keys over the block's cells
++        ggml_tensor * x = ggml_get_rows(ctx0, blocks(k_st), ri->upd_src);                       // [GD*L, n_upd]
++        x = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, x, GD, L, ri->n_upd), 1, 0, 2, 3));   // [L, GD, n_upd]
++        auto pool_max = [&](ggml_tensor * y) {                                                   // -> [D, n_upd, G]
++            y = ggml_add(ctx0, y, ri->upd_mask);
++            y = ggml_pool_1d(ctx0, ggml_reshape_2d(ctx0, y, L, GD * ri->n_upd), GGML_OP_POOL_MAX, L, L, 0);
++            return ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, y, D, G, ri->n_upd), 0, 2, 1, 3));
++        };
++        ggml_tensor * upd  = ggml_concat(ctx0, pool_max(x), ggml_neg(ctx0, pool_max(ggml_neg(ctx0, x))), 2);  // [D, n_upd, 2G]
++        ksum = ggml_set_rows(ctx0, mctx->get_ksum(il), upd, ri->upd_dst);        // [D, n_blk_k + 1, 2G]
++        ggml_build_forward_expand(gf, ksum);
++        cb(ksum, "ret_ksum", il);
++    }
++    const auto position = (int64_t) ubatch.pos[0] - replay_depth;
++    const bool scheduled = !replay.route.empty() && ri->dec && position >= 0 && position < replay_steps &&
++        il >= 3 && il <= 23 && il % 4 == 3;
++    const int replay_layer = (il - 3) / 4;
++    const uint8_t mode = scheduled ? replay.route[replay_layer * replay_steps + position] : 1;
+     ggml_tensor * cur;
+-    if (!ri->dec) {
+-        cur = build_attn_mha(q_cur, mctx->get_k(ctx0, il), mctx->get_v(ctx0, il), nullptr, inp->get_kq_mask(),
+-                             nullptr, nullptr, 0, kq_scale, il);
++    if (!ri->dec || (!replay.route.empty() && mode == 1)) {
++        cur = build_attn_mha(q_cur, mctx->get_k(ctx0, il), mctx->get_v(ctx0, il), nullptr,
++                             inp->get_kq_mask(), nullptr, nullptr, 0, kq_scale, il);
++    } else if (scheduled && mode == 0) {
++        auto gather_window = [&](ggml_tensor * st) {
++            auto * w = ggml_get_rows(ctx0, ggml_view_2d(ctx0, st, GD, kv_size,
++                                     ggml_row_size(st->type, GD), 0), ri->idx_sw);
++            return ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, w, D, G, SW), 0, 2, 1, 3));
++        };
++        auto * q = ggml_reshape_3d(ctx0, q_cur, D, R, G);
++        auto * k = gather_window(k_st);
++        auto * vt = ggml_cont(ctx0, ggml_permute(ctx0, gather_window(v_st), 1, 0, 2, 3));
++        auto * mask = ggml_cont(ctx0, ggml_view_2d(ctx0, ri->kq_mask, SW, R, ri->kq_mask->nb[1], 0));
++        auto * p = ggml_soft_max_ext(ctx0, ggml_mul_mat(ctx0, k, q), mask, kq_scale, 0.0f);
++        cur = ggml_reshape_2d(ctx0, ggml_mul_mat(ctx0, vt, p), D * R * G, 1);
+     } else {
+-        // block scores: upper bound of q.k = relu(q).kmax + min(q, 0).kmin, the max over the query heads of a group
+-        ggml_tensor * q    = ggml_reshape_3d(ctx0, q_cur, D, R, G);
+-        ggml_tensor * kmax = ggml_view_3d(ctx0, ksum, D, ri->n_blk_u, G, ksum->nb[1], ksum->nb[2], 0);
+-        ggml_tensor * kmin = ggml_view_3d(ctx0, ksum, D, ri->n_blk_u, G, ksum->nb[1], ksum->nb[2], G * ksum->nb[2]);
+-        ggml_tensor * qn   = ggml_neg(ctx0, ggml_relu(ctx0, ggml_neg(ctx0, q)));
+-        ggml_tensor * ub   = ggml_add(ctx0, ggml_mul_mat(ctx0, kmax, ggml_relu(ctx0, q)), ggml_mul_mat(ctx0, kmin, qn));  // [n_blk_u, R, G]
+-        ub = ggml_cont(ctx0, ggml_permute(ctx0, ub, 1, 0, 2, 3));                            // [R, n_blk_u, G]
+-        ub = ggml_pool_1d(ctx0, ggml_reshape_2d(ctx0, ub, R, ri->n_blk_u * G), GGML_OP_POOL_MAX, R, R, 0);
+-        ub = ggml_add(ctx0, ggml_reshape_2d(ctx0, ub, ri->n_blk_u, G), ri->cand);           // [n_blk_u, G]
+-        ggml_tensor * top = ggml_reshape_1d(ctx0, ggml_top_k(ctx0, ub, K), K * G);          // pick k + K*g: head g's block
++
++        ggml_tensor * q = ggml_reshape_3d(ctx0, q_cur, D, R, G);
++        ggml_tensor * top;
++        if (scheduled) {
++            GGML_ASSERT(mode == 2 && K == replay_topk && G == replay_groups);
++            top = ggml_view_1d(ctx0, ri->cand, K * G, replay_layer * replay_per_step * sizeof(int32_t));
++        } else {
++            // block scores: upper bound of q.k = relu(q).kmax + min(q, 0).kmin, the max over the query heads of a group
++            ggml_tensor * kmax = ggml_view_3d(ctx0, ksum, D, ri->n_blk_u, G, ksum->nb[1], ksum->nb[2], 0);
++            ggml_tensor * kmin = ggml_view_3d(ctx0, ksum, D, ri->n_blk_u, G, ksum->nb[1], ksum->nb[2], G * ksum->nb[2]);
++            ggml_tensor * qn   = ggml_neg(ctx0, ggml_relu(ctx0, ggml_neg(ctx0, q)));
++            ggml_tensor * ub   = ggml_add(ctx0, ggml_mul_mat(ctx0, kmax, ggml_relu(ctx0, q)), ggml_mul_mat(ctx0, kmin, qn));  // [n_blk_u, R, G]
++            ub = ggml_cont(ctx0, ggml_permute(ctx0, ub, 1, 0, 2, 3));                            // [R, n_blk_u, G]
++            ub = ggml_pool_1d(ctx0, ggml_reshape_2d(ctx0, ub, R, ri->n_blk_u * G), GGML_OP_POOL_MAX, R, R, 0);
++            ub = ggml_add(ctx0, ggml_reshape_2d(ctx0, ub, ri->n_blk_u, G), ri->cand);           // [n_blk_u, G]
++            top = ggml_reshape_1d(ctx0, ggml_top_k(ctx0, ub, K), K * G);          // pick k + K*g: head g's block
++        }
+         cb(top, "ret_top", il);
+ 
+         // gather sinks + window + the picked blocks (whole blocks are fetched; each head keeps its own picks)
