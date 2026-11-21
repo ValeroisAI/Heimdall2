@@ -1,0 +1,46 @@
+#version 450
+
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0) readonly buffer PackedCentroids { uint words[]; } centroids;
+layout(set = 0, binding = 1) readonly buffer Queries { vec4 values[]; } queries;
+#ifdef PER_HEAD
+layout(set = 0, binding = 2) writeonly buffer Scores { vec4 values[]; } scores;
+#else
+layout(set = 0, binding = 2) writeonly buffer Scores { float values[]; } scores;
+#endif
+layout(push_constant) uniform Counts { uint rows_per_group; } counts;
+
+// Each lane reads eight signed nibbles. Four lanes share an fp16 scale.
+// A row holds 32 code words followed by four words containing pairs of scales.
+shared vec4 partial[32];
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x;
+    uint row_start = row * 36;
+    uint query_start = (row / counts.rows_per_group) * 256 + 8 * lane;
+    uint packed = centroids.words[row_start + lane];
+    vec2 scales = unpackHalf2x16(centroids.words[row_start + 32 + lane / 8]);
+    float scale = scales[(lane / 4) % 2];
+    vec4 sum = vec4(0);
+    for (int j = 0; j < 8; ++j) {
+        float value = float(bitfieldExtract(int(packed), 4 * j, 4));
+        sum += value * queries.values[query_start + uint(j)];
+    }
+    partial[lane] = scale * sum;
+    barrier();
+    for (uint stride = 16; stride > 0; stride /= 2) {
+        if (lane < stride) {
+            partial[lane] += partial[lane + stride];
+        }
+        barrier();
+    }
+    if (lane == 0) {
+        vec4 result = partial[0];
+#ifdef PER_HEAD
+        scores.values[row] = result;
+#else
+        scores.values[row] = max(max(result.x, result.y), max(result.z, result.w));
+#endif
+    }
+}

@@ -75,6 +75,8 @@ def test_motor_end_to_end(tiny_dir, tmp_path):
                 "--parca", "32", "--adim", "20", "--sentetik", "0", "--kayip-orani", "0.5", "--keep-every", "2",
                 "--device", "cpu"]
     motor.main()
+    assert "→" in (tmp_path / "run" / "motor.log").read_text(encoding="utf-8")
+    assert not (tmp_path / "run" / "gizli.bin").exists()
     st = torch.load(tmp_path / "run" / "donusum_param.pt", weights_only=False)
     assert [cv["name"] for cv in st["conv"]] == ["layers.3"]           # 2 dikkat katmanından 2.si (7) global kalır
     m = HybridLM.load(tiny_dir).eval()

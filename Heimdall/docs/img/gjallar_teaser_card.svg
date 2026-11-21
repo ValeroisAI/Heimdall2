@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 580" width="1000" height="580" role="img" aria-label="Gjallar Architecture Design Card: 1M Context on 16 GB Consumer GPU"><style>
+  .bg{fill:#0d1117}.fg{fill:#e6e9ef}.mu{fill:#9aa4b5}.ln{stroke:#2c3442}.st{stroke:#e6e9ef}
+  .win{fill:#e6a03c}.mem{fill:#3cc4b7}.keep{fill:#a08bff}.accent{fill:#58a6ff}.green{fill:#3fb950}.red{fill:#f85149}
+  .card{fill:#161b22;stroke:#30363d;stroke-width:1.2}
+  .highlight{fill:#1c2333;stroke:#58a6ff;stroke-width:1.6}
+  text{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+</style>
+
+<rect width="1000" height="580" rx="16" class="bg"/>
+
+<!-- Glow Header Accent -->
+<rect x="0" y="0" width="1000" height="6" fill="url(#grad)" rx="3"/>
+<defs>
+  <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="0%">
+    <stop offset="0%" stop-color="#3cc4b7"/>
+    <stop offset="50%" stop-color="#58a6ff"/>
+    <stop offset="100%" stop-color="#a08bff"/>
+  </linearGradient>
+</defs>
+
+<!-- Brand & Title -->
+<text x="36" y="44" font-size="12" class="accent" font-weight="700" letter-spacing="1.5">VALEROIS RESEARCH · HEIMDALL PROJECT</text>
+<text x="36" y="78" font-size="26" class="fg" font-weight="800">GJALLAR: The Surprise-Gated Hybrid Architecture</text>
+<text x="36" y="102" font-size="14" class="mu">Design &amp; feasibility study · 1M-token context, exact KV in host RAM (selector measured, gate unproven)</text>
+
+<!-- 4 Key Stat Cards -->
+<g transform="translate(36, 124)">
+  <!-- Card 1 -->
+  <rect x="0" y="0" width="216" height="106" rx="10" class="card"/>
+  <text x="18" y="28" font-size="11" class="mu" font-weight="600">GPU VRAM AT 1M (CALC)</text>
+  <text x="18" y="66" font-size="32" class="green" font-weight="800">~170 MiB</text>
+  <text x="18" y="90" font-size="11" class="mu">27B GPU @1M: 32 MB win + ~136 MiB index</text>
+
+  <!-- Card 2 -->
+  <rect x="236" y="0" width="216" height="106" rx="10" class="card"/>
+  <text x="254" y="28" font-size="11" class="mu" font-weight="600">GAP RECOVERED, 25% READS</text>
+  <text x="254" y="66" font-size="32" class="accent" font-weight="800">44–46%</text>
+  <text x="254" y="90" font-size="11" class="mu">causal centroid gate, 0.8B, 2 texts (replay)</text>
+
+  <!-- Card 3 -->
+  <rect x="472" y="0" width="216" height="106" rx="10" class="card"/>
+  <text x="490" y="28" font-size="11" class="mu" font-weight="600">DELAYED PASS-KEY, 32K</text>
+  <text x="490" y="66" font-size="32" class="win" font-weight="800">3/3</text>
+  <text x="490" y="90" font-size="11" class="mu">at 24–25% reads (3 depths, replay)</text>
+
+  <!-- Card 4 -->
+  <rect x="708" y="0" width="220" height="106" rx="10" class="card"/>
+  <text x="726" y="28" font-size="11" class="mu" font-weight="600">ALWAYS-OPEN C4 SELECTOR</text>
+  <text x="726" y="66" font-size="32" class="keep" font-weight="800">89–97%</text>
+  <text x="726" y="90" font-size="11" class="mu">of window→full NLL gap (measured)</text>
+</g>
+
+<!-- Comparison Table -->
+<g transform="translate(36, 256)">
+  <!-- Table Header -->
+  <rect x="0" y="0" width="928" height="38" rx="6" class="card"/>
+  <text x="20" y="24" font-size="12" class="mu" font-weight="700">ARCHITECTURE</text>
+  <text x="270" y="24" font-size="12" class="mu" font-weight="700">GPU CACHE (128K)</text>
+  <text x="440" y="24" font-size="12" class="mu" font-weight="700">GPU CACHE (1M)</text>
+  <text x="610" y="24" font-size="12" class="mu" font-weight="700">DECODE (64K SPEED)</text>
+  <text x="770" y="24" font-size="12" class="mu" font-weight="700">STATUS / RETRIEVAL</text>
+
+  <!-- Row 1: Full Attention -->
+  <rect x="0" y="44" width="928" height="46" rx="6" class="card"/>
+  <text x="20" y="72" font-size="13" class="fg" font-weight="600">Full Attention (Qwen/Llama)</text>
+  <text x="270" y="72" font-size="13" class="red mono">8.0 GB (calc)</text>
+  <text x="440" y="72" font-size="13" class="red mono">&gt;64 GB (OOM)</text>
+  <text x="610" y="72" font-size="13" class="mu mono">226 t/s (measured)</text>
+  <text x="770" y="72" font-size="12" class="mu">Exact / VRAM Bounded</text>
+
+  <!-- Row 2: Pure Recurrent / SSM -->
+  <rect x="0" y="96" width="928" height="46" rx="6" class="card"/>
+  <text x="20" y="124" font-size="13" class="fg" font-weight="600">Linear / SSM (Mamba/RWKV)</text>
+  <text x="270" y="124" font-size="13" class="win mono">0.1 GB (calc)</text>
+  <text x="440" y="124" font-size="13" class="win mono">0.1 GB (calc)</text>
+  <text x="610" y="124" font-size="13" class="fg mono">n/a</text>
+  <text x="770" y="124" font-size="12" class="red">Memory Fog / Decay</text>
+
+  <!-- Row 3: Gjallar (Highlight) -->
+  <rect x="0" y="148" width="928" height="52" rx="8" class="highlight"/>
+  <text x="20" y="180" font-size="14.5" class="accent" font-weight="800">Gjallar (Surprise-Gated)</text>
+  <text x="270" y="180" font-size="14" class="green mono" font-weight="700">32 MB (calc)</text>
+  <text x="440" y="180" font-size="14" class="green mono" font-weight="700">~170 MiB (calc, 27B)</text>
+  <text x="610" y="180" font-size="14" class="green mono" font-weight="700">not measured</text>
+  <text x="770" y="180" font-size="13" class="green" font-weight="700">Proposed / In Progress</text>
+</g>
+
+<!-- Footer Notes & Hardware Environment -->
+<g transform="translate(36, 485)">
+  <rect x="0" y="0" width="928" height="65" rx="8" class="card"/>
+  <text x="18" y="25" font-size="11.5" class="fg" font-weight="600">Honest Verification Standard:</text>
+  <text x="18" y="46" font-size="11" class="mu">Values marked (calc) are architectural formulas; (measured) are real runs on AMD RX 9070 XT / Qwen3.5-0.8B; (replay) = causal gate on frozen captures, 2 short texts, not a live gated model. Decode speed is not measured.</text>
+  <text x="910" y="38" font-size="11" text-anchor="end" class="accent" font-weight="600">Open-Source Apache 2.0 · Valerois Team</text>
+</g>
+
+</svg>
