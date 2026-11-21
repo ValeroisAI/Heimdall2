@@ -97,7 +97,7 @@ def test_end_to_end(monkeypatch_dir=None):
     rows.append(json.dumps({"messages": json.dumps(trace(4))}))                    # messages JSON METNİ olarak (D3 biçimi)
     rows.append("{bozuk json")
     src = tmp / "d3.jsonl"
-    src.write_text("\n".join(rows) + "\n")
+    src.write_text("\n".join(rows) + "\n", encoding="utf-8")
     import huggingface_hub
     orig = huggingface_hub.hf_hub_download
     huggingface_hub.hf_hub_download = lambda repo, path, repo_type=None: str(src)
@@ -107,20 +107,23 @@ def test_end_to_end(monkeypatch_dir=None):
         assert S.run(args) == 0
     finally:
         huggingface_hub.hf_hub_download = orig
-    man = json.loads((out / "manifest.json").read_text())
+    man = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     d3 = man["kaynaklar"]["d3"]
     assert d3["atildi:tekrar"] == 1 and d3["atildi:json_satir"] == 1 and d3["tutulan"] == 301
-    n_text = sum(1 for _ in open(out / "train_metin.jsonl")) + sum(1 for _ in open(out / "eval_metin.jsonl"))
-    n_tool = sum(1 for _ in open(out / "train_arac.jsonl")) + sum(1 for _ in open(out / "eval_arac.jsonl"))
+    text_rows = [(out / name).read_text(encoding="utf-8").splitlines()
+                 for name in ("train_metin.jsonl", "eval_metin.jsonl")]
+    tool_rows = [(out / name).read_text(encoding="utf-8").splitlines()
+                 for name in ("train_arac.jsonl", "eval_arac.jsonl")]
+    n_text = sum(map(len, text_rows))
+    n_tool = sum(map(len, tool_rows))
     assert (n_text, n_tool) == (300, 1)
     for name in ("train_metin", "eval_metin", "train_arac", "eval_arac"):             # meta, satırlarla hizalı
-        a = [json.loads(line) for line in open(out / f"{name}.jsonl")]
-        b = [json.loads(line) for line in open(out / f"{name}.meta.jsonl")]
+        a = [json.loads(line) for line in (out / f"{name}.jsonl").read_text(encoding="utf-8").splitlines()]
+        b = [json.loads(line) for line in (out / f"{name}.meta.jsonl").read_text(encoding="utf-8").splitlines()]
         assert len(a) == len(b) and all(set(x) == {"messages"} for x in a)             # satır içinde fazladan alan YOK
         assert all(m["kaynak"] == "d3" and m["lisans_beyani"] for m in b)
-    assert 0 < sum(1 for _ in open(out / "eval_metin.jsonl")) < 20                      # ~%1 değerlendirme
-    first = json.loads(open(out / "train_arac.jsonl").readline() if (out / "train_arac.jsonl").stat().st_size
-                       else open(out / "eval_arac.jsonl").readline())
+    assert 0 < len(text_rows[1]) < 20                                                # ~%1 değerlendirme
+    first = json.loads((tool_rows[0] or tool_rows[1])[0])
     assert any(m["role"] == "tool" for m in first["messages"])
 
 
