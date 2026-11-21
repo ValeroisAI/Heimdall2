@@ -9,7 +9,7 @@ Extends Heimdall/Bifrost hybrid architecture with:
 3. Fast-Path / Slow-Path execution with budget-aware inference stats.
 """
 
-from typing import Optional, Tuple, Dict
+from typing import Dict, Optional, Tuple, Union
 import math
 import torch
 import torch.nn as nn
