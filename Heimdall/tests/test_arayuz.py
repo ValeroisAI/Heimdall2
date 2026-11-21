@@ -40,7 +40,15 @@ def test_api():
     arayuz._running = lambda pattern: False
     assert c.post("/api/start", json={"model": "a/gemma"}).status_code == 422   # desteklenmeyen model
 
-    arayuz.subprocess.Popen = FakeProc
+    real_popen = arayuz.subprocess.Popen
+    arayuz.subprocess.Popen = FakeProc            # subprocess modülü paylaşımlı: sonda geri konur
+    try:
+        _start_with_fake(c)
+    finally:
+        arayuz.subprocess.Popen = real_popen
+
+
+def _start_with_fake(c):
     r = c.post("/api/start", json={"model": "a/ok", "q4": True, "batch": 1, "steps_a": 5, "steps_b": 6})
     assert r.status_code == 200, r.text
     cmd = FakeProc.cmd

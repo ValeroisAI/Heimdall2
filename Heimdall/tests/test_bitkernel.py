@@ -1,17 +1,38 @@
 """Triton çekirdekleri, Triton yorumlayıcısında (CPU) bağımsız torch referansına karşı.
 GPU'da derlenmiş çekirdek ayrıca bench/bitkernel.py ile doğrulanır."""
 import os
+import subprocess
 import sys
 from pathlib import Path
 
-os.environ["TRITON_INTERPRET"] = "1"
+# Triton yorumlayıcısı (CPU) süreç başında seçilir: fla gibi başka bir modül Triton'u önceden yüklediyse ya da GPU testleri
+# aynı süreçte koşuyorsa TRITON_INTERPRET=1 sonradan ayarlanamaz (yarım devreye girer, GPU testlerini de bozar).
+# Bu yüzden Triton'lu iki test ayrı bir süreçte, ayarla birlikte koşar.
+CHILD = os.environ.get("HEIMDALL_TRITON_CHILD") == "1"
+if CHILD:
+    os.environ["TRITON_INTERPRET"] = "1"
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
 import torch  # noqa: E402
 import pytest  # noqa: E402
 
 import importlib.util  # noqa: E402
 
-needs_triton = pytest.mark.skipif(importlib.util.find_spec("triton") is None,
-                                  reason="Triton is not installed (pip install triton; on CPU set TRITON_INTERPRET=1)")
+_no_triton = pytest.mark.skipif(importlib.util.find_spec("triton") is None,
+                                reason="Triton is not installed (pip install triton)")
+
+
+def needs_triton(fn):
+    """Süreç içinde çocuk olarak aynen koşar; ana süreçte aynı testi temiz bir alt süreçte çalıştırır."""
+    if CHILD:
+        return _no_triton(fn)
+
+    def run_isolated():
+        env = {**os.environ, "HEIMDALL_TRITON_CHILD": "1"}
+        r = subprocess.run([sys.executable, "-m", "pytest", f"{__file__}::{fn.__name__}", "-q", "-x", "-p", "no:cacheprovider"],
+                           capture_output=True, text=True, env=env)
+        assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-1000:]
+    run_isolated.__name__ = fn.__name__
+    return _no_triton(run_isolated)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from heimdall.bitkernel import int8_matmul, pack_weights, packed_matmul, unpack_weights  # noqa: E402
