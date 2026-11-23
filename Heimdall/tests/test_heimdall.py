@@ -20,6 +20,7 @@ BASE = HeimdallConfig(vocab_size=300, d_model=64, n_layers=4, n_heads=2, head_di
                       attn_heads=4, attn_kv_heads=2, attn_head_dim=16, chunk_size=16, kernel="torch")
 VARIANTS = {"hibrit": apply_arch(BASE, "hibrit"), "transformer": apply_arch(BASE, "transformer"),
             "sabit": replace(apply_arch(BASE, "sabit"), attn_window=8), "kisa": apply_arch(BASE, "kisa"),
+            "dongu": replace(apply_arch(BASE, "hibrit"), loop_start=1, loop_end=3, loop_iters=2),
             "moe": replace(apply_arch(BASE, "hibrit"), moe_experts=8, moe_topk=2, moe_hidden=32)}
 
 
@@ -30,6 +31,9 @@ def _model(cfg, seed=0):
         for name, p in m.named_parameters():
             if name.endswith(("o_proj.weight", "w3.weight", "ffn.w3")):
                 p.normal_(0, 0.05)
+        for g in m.loop_gates:                               # döngü kapılarını aç: 2. geçiş gerçekten etkili olsun
+            g.weight.normal_(0, 0.05)
+            g.bias.zero_()
     return m.eval()
 
 
@@ -58,6 +62,28 @@ def test_causal():
             a, b = m(ids), m(ids2)
         assert torch.allclose(a[:, :25], b[:, :25], atol=1e-5), name
         assert not torch.allclose(a[:, 25:], b[:, 25:]), name
+
+
+def test_loop_from_plain_checkpoint():
+    """Döngüsüz model, döngülü modele yüklenir (yeni kapılar hariç tüm anahtarlar eşleşir). Kapılar tamamen kapalıyken
+    çıktı birebir aynıdır; varsayılan (kapalıya yakın) başlangıçta fark küçüktür; döngü çalıştırma sırası doğrudur."""
+    plain = _model(VARIANTS["hibrit"])
+    cfg = replace(VARIANTS["hibrit"], loop_start=1, loop_end=3, loop_iters=2)
+    assert cfg.exec_order == [(0, 0), (1, 0), (2, 0), (1, 1), (2, 1), (3, 0)]
+    loop = HeimdallLM(cfg).eval()
+    missing, unexpected = loop.load_state_dict(plain.state_dict(), strict=False)
+    assert not unexpected and missing and all(k.startswith("loop_gates.") for k in missing)
+    assert len(loop.loop_gates) == 2
+    ids = torch.randint(0, 300, (2, 40))
+    with torch.no_grad():
+        ref = plain(ids)
+        near = loop(ids)                                   # varsayılan kapı ≈ 0.018
+        loop.reset_loop_gates(-1e4)                        # tamamen kapalı
+        exact = loop(ids)
+    assert torch.allclose(exact, ref, atol=1e-5), (exact - ref).abs().max()
+    rel = ((near - ref).norm() / ref.norm()).item()
+    assert 0 < rel < 0.05, rel
+    assert loop.exec_params() > loop.active_params()
 
 
 def test_cache_matches_full_forward():

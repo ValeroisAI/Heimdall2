@@ -75,6 +75,10 @@ def parse_args(argv=None):
     p.add_argument("--device", default=None)
     p.add_argument("--out", default="runs/heimdall")
     p.add_argument("--resume")
+    p.add_argument("--baslangic", help="ağırlıkları bu checkpoint'ten al, yeni optimizer ve adım 0 ile başla "
+                                       "(sürekli eğitim; --dongu ile döngü eklenebilir, yeni kapılar kapalı başlar)")
+    p.add_argument("--dongu", help="döngülenecek katman aralığı BAŞ:SON (ör. 4:8 = 4..7)")
+    p.add_argument("--dongu-tekrar", type=int, default=2, help="--dongu: geçiş sayısı")
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-batches", type=int, default=32)
@@ -100,7 +104,7 @@ def build_config(args) -> HeimdallConfig:
 def flops_per_token(cfg: HeimdallConfig, n_matmul: int, t: int) -> float:
     """6·N + karıştırıcı (ileri+geri ≈ 3× ileri)."""
     f = 6 * n_matmul
-    for kind in cfg.kinds:
+    for kind in (cfg.kinds[i] for i, _ in cfg.exec_order):
         if kind == "A":
             span = min(cfg.attn_window or t, t)
             f += 3 * 2 * 2 * cfg.attn_heads * cfg.attn_head_dim * span / (1 if cfg.attn_window else 2)
@@ -157,7 +161,15 @@ def main(argv=None) -> None:
         sys.exit("--retry-index >= 0 ve 0 < --lr-scale <= 1 gerekli")
 
     preset = PRESETS[args.preset]
-    cfg = HeimdallConfig(**ckpt["config"]) if ckpt else build_config(args)
+    init = None
+    if args.baslangic and not ckpt:
+        init = torch.load(args.baslangic, map_location="cpu", weights_only=False)
+        cfg = HeimdallConfig(**init["config"])
+    else:
+        cfg = HeimdallConfig(**ckpt["config"]) if ckpt else build_config(args)
+    if args.dongu and not ckpt:
+        a, b = (int(v) for v in args.dongu.split(":"))
+        cfg = replace(cfg, loop_start=a, loop_end=b, loop_iters=args.dongu_tekrar)
     args.arch = args.arch or preset.arch
     seq_len = args.seq_len or preset.seq_len
     micro = args.micro_batch or preset.micro_batch
@@ -191,6 +203,15 @@ def main(argv=None) -> None:
             opt.load_state_dict(st)
         step, tokens = ckpt["step"], ckpt["tokens"]
         del ckpt
+    elif init:
+        missing, unexpected = model.load_state_dict(init["model"], strict=False)
+        bad = [k for k in missing if not k.startswith("loop_gates.")]
+        if bad or unexpected:
+            sys.exit(f"--baslangic uyumsuz: eksik {bad[:5]}, fazla {list(unexpected)[:5]}")
+        print(f"başlangıç: {args.baslangic} (adım {init.get('step')}, {init.get('tokens', 0) / 1e6:,.0f}M token)"
+              f"{f' | döngü {cfg.loop_start}:{cfg.loop_end} × {cfg.loop_iters}, {len(model.loop_gates)} yeni kapı' if cfg.loop_iters > 1 else ''}",
+              flush=True)
+        del init
 
     mix = Mixture(args.data, args.val_frac, seed=args.seed + step + args.retry_index * 1_000_000_007)
     for path, _, split in mix.sources:
@@ -201,7 +222,7 @@ def main(argv=None) -> None:
     budget = args.tokens if timed else (args.tokens or 1e9)
     total = max(1, int(budget // tokens_per_step)) if budget is not None else None
     step_limit = f"{total:,}" if total is not None else "süreli"
-    n_matmul = model.active_params() + model.lm_head.weight.numel()
+    n_matmul = model.exec_params() + model.lm_head.weight.numel()
     train_model = torch.compile(model) if args.compile and device.type != "cpu" else model
 
     out = Path(args.out)

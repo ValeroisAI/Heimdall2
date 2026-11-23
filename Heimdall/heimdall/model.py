@@ -308,8 +308,15 @@ class HeimdallLM(nn.Module):
         self.norm = RMSNorm(cfg.d_model, cfg.norm_eps)
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         self.mtp = nn.ModuleList([MTPModule(cfg) for _ in range(cfg.mtp_depth)])
+        # Döngü: her (katman, geçiş ≥ 1) için token başına kapı. _slots: (katman, kapı indeksi ya da -1)
+        self._slots, n_gates = [], 0
+        for layer, it in cfg.exec_order:
+            self._slots.append((layer, n_gates if it > 0 else -1))
+            n_gates += it > 0
+        self.loop_gates = nn.ModuleList([nn.Linear(cfg.d_model, 1) for _ in range(n_gates)])
         self.grad_ckpt = False
         self._init_weights()
+        self.reset_loop_gates()
         if cfg.tie_embeddings:
             self.lm_head.weight = self.embed.weight
 
@@ -327,6 +334,33 @@ class HeimdallLM(nn.Module):
                     nn.init.zeros_(m.weight)
                 elif isinstance(m, BitLinear):
                     m.zero_()
+
+    LOOP_GAIN = 8.0   # kapı sapmasının etkin öğrenme hızı çarpanı: kısa sürekli eğitimde kapı açılabilsin
+
+    def reset_loop_gates(self, logit: float = -4.0) -> None:
+        """Kapılar kapalı başlar (sigmoid(-4) ≈ 0.018): yüklenen model neredeyse aynen çalışır."""
+        with torch.no_grad():
+            for g in self.loop_gates:
+                g.weight.zero_()
+                g.bias.fill_(logit / self.LOOP_GAIN)
+
+    def _gate(self, j: int, x: torch.Tensor) -> torch.Tensor:
+        g = self.loop_gates[j]
+        xn = F.rms_norm(x, (x.size(-1),), eps=self.cfg.norm_eps)
+        return torch.sigmoid(F.linear(xn, g.weight.to(x.dtype)) + self.LOOP_GAIN * g.bias.to(x.dtype))
+
+    def _run_slot(self, layer: int, j: int, x, cache=None, pos=None, lens=None):
+        blk = self.blocks[layer]
+        if cache is None:
+            y = checkpoint(blk, x, use_reentrant=False) if (self.grad_ckpt and self.training) else blk(x)
+        else:
+            y = blk(x, cache, pos, lens)
+        return y if j < 0 else x + self._gate(j, x) * (y - x)
+
+    def exec_params(self) -> int:
+        """Token başına çalışan parametre: döngüdeki katmanlar her geçişte yeniden sayılır."""
+        extra = sum(sum(p.numel() for p in self.blocks[i].parameters()) for i, it in self.cfg.exec_order if it > 0)
+        return self.active_params() + extra
 
     def active_params(self) -> int:
         """Token başına kullanılan parametre (MoE'de yalnız seçilen uzmanlar)."""
@@ -350,13 +384,13 @@ class HeimdallLM(nn.Module):
         """Eğitim: model(ids, targets) → loss.  Çıkarım: model(ids, cache=c) → logits (cache yerinde güncellenir)."""
         x = self.embed(ids)
         if cache is None:
-            for blk in self.blocks:
-                x = checkpoint(blk, x, use_reentrant=False) if (self.grad_ckpt and self.training) else blk(x)
+            for layer, j in self._slots:
+                x = self._run_slot(layer, j, x)
         else:
             lens = cache["lens"]
             pos = torch.tensor(lens, device=ids.device)
-            for blk, c in zip(self.blocks, cache["layers"]):
-                x = blk(x, c, pos, lens)
+            for (layer, j), c in zip(self._slots, cache["layers"]):
+                x = self._run_slot(layer, j, x, c, pos, lens)
             cache["lens"] = [n + ids.size(1) for n in lens]
         if last_only:
             x = x[:, -1:]
@@ -390,7 +424,8 @@ class HeimdallLM(nn.Module):
     # ------------------------------------------------------------------ cache yönetimi
     def new_cache(self, batch: int = 1) -> dict:
         w = self.embed.weight
-        return {"lens": [0] * batch, "layers": [b.mixer.empty_cache(batch, w.device, w.dtype) for b in self.blocks]}
+        return {"lens": [0] * batch,
+                "layers": [self.blocks[layer].mixer.empty_cache(batch, w.device, w.dtype) for layer, _ in self._slots]}
 
     @staticmethod
     def cache_select(cache: dict, keep: List[int]) -> dict:

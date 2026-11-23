@@ -53,6 +53,12 @@ class HeimdallConfig:
     # doğrulama kaybı ana tahmindir (karşılaştırılabilir). Modüller DeltaNet bloğudur (sabit bellek, taslak üretimi için).
     mtp_depth: int = 0
     mtp_weight: float = 0.3
+    # Döngü (GLM-5.4 / Universal Transformer tarzı): [loop_start, loop_end) katmanları loop_iters kez çalışır, parametre
+    # eklemeden derinlik. 2. ve sonraki geçişler artığa token başına bir kapıyla yazar (kapı kapalı başlar: model değişmez).
+    # Çıkarımda her geçişin kendi önbelleği vardır (DeltaNet: sabit boyutlu durum, dikkat: ayrı KV).
+    loop_start: int = 0
+    loop_end: int = 0
+    loop_iters: int = 1
 
     def __post_init__(self) -> None:
         assert self.layout and set(self.layout) <= {"D", "A", "C"}, "layout yalnız D, A ve C içerebilir"
@@ -65,10 +71,19 @@ class HeimdallConfig:
         assert not (self.bits and self.moe_experts), "bits ile MoE henüz birlikte desteklenmiyor"
         assert self.attn_rope in ("auto", "rope", "none") and self.kernel in ("auto", "torch")
         assert self.mtp_depth >= 0 and self.mtp_weight >= 0
+        assert self.loop_iters >= 1 and 0 <= self.loop_start <= self.loop_end <= self.n_layers
+        assert self.loop_iters == 1 or self.loop_end > self.loop_start, "döngü için loop_start < loop_end gerekli"
 
     @property
     def kinds(self) -> list:
         return [self.layout[i % len(self.layout)] for i in range(self.n_layers)]
+
+    @property
+    def exec_order(self) -> list:
+        """Çalışma sırası: (katman, geçiş) çiftleri. Döngü yoksa her katman bir kez, geçiş 0."""
+        a, b = (self.loop_start, self.loop_end) if self.loop_iters > 1 else (self.n_layers, self.n_layers)
+        return ([(i, 0) for i in range(a)] + [(i, it) for it in range(self.loop_iters) for i in range(a, b)]
+                + [(i, 0) for i in range(b, self.n_layers)])
 
     @property
     def use_rope(self) -> bool:
