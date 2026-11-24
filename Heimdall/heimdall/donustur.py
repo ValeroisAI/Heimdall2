@@ -205,8 +205,27 @@ class ConvAttention(nn.Module):
             self.k_norm = RMSNorm(self.dh, tc.eps)
         self.attn_sub_norm = RMSNorm(self.h * self.dh, tc.eps) if tc.bitnet else nn.Identity()
         self.converted = False
+        self.fresh, self.fresh_kind = None, None     # iskelet deneyi: dikkatin yerine geçen sıfırdan karıştırıcı
         self.mode = "teacher"          # teacher | student | layer (aşama A) | window (yalnız pencere, karşılaştırma)
         self.aux = None
+
+    def convert_fresh(self, kind: str) -> None:
+        """İskelet deneyi: q/k/v/o ve pencere dikkati KULLANILMAZ; sıfırdan başlayan bir Heimdall karıştırıcısı
+        ("delta" = GatedDeltaNet, "conv" = kapılı kısa evrişim) dikkatin yerine geçer. FFN, gömme ve normlar donuk kalır."""
+        from .config import HeimdallConfig
+        from .model import GatedDeltaNet, ShortConv
+        tc = self.tc
+        cfg = HeimdallConfig(d_model=tc.d, n_heads=tc.n_heads, head_dim=tc.head_dim, archival_heads=0,
+                             attn_heads=tc.n_heads, attn_kv_heads=tc.n_kv, attn_head_dim=tc.head_dim,
+                             layout="D" if kind == "delta" else "C", norm_eps=tc.eps)
+        mod = {"delta": GatedDeltaNet, "conv": ShortConv}[kind](cfg)
+        for m in mod.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        mod.reset_parameters()
+        self.fresh, self.fresh_kind, self.converted = mod, kind, True
 
     def convert(self, window: int, sinks: int, archival: int) -> None:
         h, dh = self.h, self.dh
@@ -230,6 +249,8 @@ class ConvAttention(nn.Module):
         self.converted = True
 
     def new_params(self):
+        if self.fresh is not None:
+            return list(self.fresh.parameters())
         return [p for n, p in self.named_parameters() if not n.startswith(("q_proj", "k_proj", "v_proj", "o_proj",
                                                                            "q_norm", "k_norm", "attn_sub_norm"))]
 
@@ -360,6 +381,17 @@ class ConvAttention(nn.Module):
 
     def forward(self, x, cache=None, start: int = 0):
         b, t, _ = x.shape
+        if self.fresh is not None and self.mode != "teacher":
+            if cache is not None:
+                raise NotImplementedError("iskelet karıştırıcılı modelde önbellekli çıkarım henüz yok (yalnız ppl ölçümü)")
+            if self.mode == "layer":            # artık akış öğretmenden; yeni karıştırıcı yan hesaplanır, çıktısı hedefe benzetilir
+                with torch.no_grad():
+                    q, k, v, qr, kr = self._qkv(x)
+                    y = self.o_proj(self.attn_sub_norm(self._full(qr, kr, v).reshape(b, t, -1).to(x.dtype)))
+                y_s = self.fresh(x)
+                self.aux = (y_s.float() - y.float()).square().mean() / y.float().square().mean().clamp(min=1e-8)
+                return y
+            return self.fresh(x)
         if cache is not None:
             if not self.converted or self.mode == "teacher":
                 o = self._full_cached(x, cache, start)
@@ -470,6 +502,11 @@ class ConvLM(nn.Module):
             if i not in keep_global:
                 layer.self_attn.convert(window, sinks, int(archival_frac * self.tc.n_heads))
 
+    def convert_fresh(self, kind: str, keep_global=()) -> None:
+        for i, layer in enumerate(self.layers):
+            if i not in keep_global:
+                layer.self_attn.convert_fresh(kind)
+
     def set_mode(self, mode: str) -> None:
         for layer in self.layers:
             layer.self_attn.mode = mode
@@ -514,12 +551,13 @@ class ConvLM(nn.Module):
         return out, cache
 
     def save_conversion(self, path, meta=None) -> None:
-        conv = [dict(i=i, window=l.self_attn.window, sinks=l.self_attn.sinks,
+        conv = [dict(i=i, fresh=l.self_attn.fresh_kind) if l.self_attn.fresh is not None else
+                dict(i=i, window=l.self_attn.window, sinks=l.self_attn.sinks,
                      archival=int((l.self_attn.decay_mask == 0).sum())) for i, l in enumerate(self.layers)
                 if l.self_attn.converted]
         torch.save({"conv": conv, "params": {n: q.detach().cpu() for n, q in self.named_parameters()
                                              if any(n.startswith(f"layers.{c['i']}.self_attn.") for c in conv)
-                                             and not n.split(".")[-2].endswith(("_proj", "_norm"))},
+                                             and (".fresh." in n or not n.split(".")[-2].endswith(("_proj", "_norm")))},
                     "meta": meta or {}}, path)
 
     @classmethod
@@ -527,7 +565,10 @@ class ConvLM(nn.Module):
         model = cls.from_pretrained(model_dir, q4=q4)
         ck = torch.load(conv_path, map_location="cpu", weights_only=False)
         for c in ck["conv"]:
-            model.layers[c["i"]].self_attn.convert(c["window"], c["sinks"], c["archival"])
+            if c.get("fresh"):
+                model.layers[c["i"]].self_attn.convert_fresh(c["fresh"])
+            else:
+                model.layers[c["i"]].self_attn.convert(c["window"], c["sinks"], c["archival"])
         missing = [n for n in ck["params"] if n not in dict(model.named_parameters())]
         assert not missing, missing
         model.load_state_dict(ck["params"], strict=False)
@@ -636,6 +677,9 @@ def main() -> None:
     p.add_argument("--sinks", type=int, default=4)
     p.add_argument("--archival-frac", type=float, default=0.25)
     p.add_argument("--keep-global", type=int, nargs="*", default=[], help="dönüştürülmeyecek katmanlar")
+    p.add_argument("--iskelet", choices=["yok", "delta", "conv"], default="yok",
+                   help="dikkat yerine SIFIRDAN yeni karıştırıcı (delta | conv); FFN/gömme/normlar donuk. Varsayılan 'yok': "
+                        "Bifrost dönüşümü (q/k/v/o yeniden kullanılır)")
     p.add_argument("--seq-len", type=int, default=1024)
     p.add_argument("--batch", type=int, default=2)
     p.add_argument("--steps-a", type=int, default=100)
@@ -668,7 +712,10 @@ def main() -> None:
     amp = torch.autocast("cuda", dtype=torch.bfloat16) if gpu else contextlib.nullcontext()
 
     model = ConvLM.from_pretrained(args.model, q4=args.q4, sensitive_bits=args.hassas_bit)
-    model.convert(args.window, args.sinks, args.archival_frac, set(args.keep_global))
+    if args.iskelet == "yok":
+        model.convert(args.window, args.sinks, args.archival_frac, set(args.keep_global))
+    else:
+        model.convert_fresh(args.iskelet, set(args.keep_global))
     model.grad_ckpt = args.grad_ckpt
     for q in model.parameters():
         q.requires_grad_(False)
@@ -684,6 +731,7 @@ def main() -> None:
     tc = model.tc
     kv_teacher = lambda n: tc.n_layers * 2 * tc.n_kv * tc.head_dim * n * 2
     state = sum(tc.n_heads * tc.head_dim ** 2 * 4 + 2 * tc.n_kv * tc.head_dim * (args.window + args.sinks) * 2
+                if args.iskelet == "yok" else (tc.n_heads * tc.head_dim ** 2 * 4 if args.iskelet == "delta" else 3 * tc.d * 2)
                 for i in range(tc.n_layers) if i not in args.keep_global)
     print(f"Öğretmen {model.n_params() / 1e6:.0f}M param{' (4-bit)' if args.q4 else ''}, {tc.n_layers} katman | yeni param "
           f"{n_new / 1e6:.2f}M | pencere {args.window} + {args.sinks} çapa | bellek: öğretmen 8K'da "
@@ -705,9 +753,10 @@ def main() -> None:
     t0 = time.time()
     with amp:
         results["ogretmen"] = evaluate(model, wins, "teacher", buckets)
-        results["yalniz_pencere"] = evaluate(model, wins, "window", buckets)
+        if args.iskelet == "yok":
+            results["yalniz_pencere"] = evaluate(model, wins, "window", buckets)
         results["donusum_egitimsiz"] = evaluate(model, wins, "student", buckets)
-    for k in ("ogretmen", "yalniz_pencere", "donusum_egitimsiz"):
+    for k in [k for k in ("ogretmen", "yalniz_pencere", "donusum_egitimsiz") if k in results]:
         print(f"{k:22s} " + " | ".join(f"{b}: {v:.2f}" for b, v in results[k].items()), flush=True)
 
     opt = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.0)
